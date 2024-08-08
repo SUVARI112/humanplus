@@ -376,9 +376,18 @@ class DeployNode(Node):
                     elif self.task == "stand_w_waist" or self.task=='wb' or self.task=='squat':
                         target_jt_hw,pose = self.get_retarget()
 
+                """ the part where the state is given to the policy and the output is given !!! """
                 # fetch proprioceptive data
                 self.obs_joint_vel_ = self.reindex_hw2urdf(self.obs_joint_vel)
                 self.obs_joint_pos_ = self.reindex_hw2urdf(self.obs_joint_pos)
+                """- self.obs_imu: IMU data (roll and pitch)
+                    - self.obs_ang_vel: Angular velocity
+                    - self.obs_joint_pos_: Joint positions (reindexed from hardware to URDF order)
+                    - self.obs_joint_vel_: Joint velocities (reindexed from hardware to URDF order)
+                    - self.prev_action: Previous action taken by the policy
+                    - target_jt_hw: Target joint positions (reindexed and scaled)
+                    - pose: Additional pose information for some tasks
+                    """
                 if self.task == "stand" or self.task == "stand_w_waist" or self.task=='squat':
                     self.obs_buf_np = np.concatenate((self.obs_imu, self.obs_ang_vel, self.obs_joint_pos_, self.obs_joint_vel_, self.prev_action, self.reindex_hw2urdf(target_jt_hw)*self.env.scale_dof_pos, np.zeros(5)))  # add reference input TODO
                 elif self.task=='wb':
@@ -441,8 +450,10 @@ class DeployNode(Node):
                         self.set_gains(np.array([0.0]*HW_DOF),self.env.d_gains)
                         self.set_motor_position(q=self.env.default_dof_pos_np)
                         raise SystemExit
+                    """Just a way of updaiting a field for publishing it later, make sure if vel of angles poses !!"""
                     self.set_motor_position(self.angles)
                     if not NO_MOTOR:
+                        """the publishing it later !!!"""
                         self.motor_pub.publish(self.cmd_msg)
                 
             while 0.019969-time.monotonic()+loop_start_time>0:  #0.012473  0.019963
