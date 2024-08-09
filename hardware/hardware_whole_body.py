@@ -209,6 +209,17 @@ class DeployNode(Node):
         self.motor_pub_freq = 50
         self.cmd_msg = LowCmd()
 
+        # ip: policy frequency defenition
+        self.policy_freq = 100
+        # ip: defining flags to make commands and changing them too.
+        self.commands = np.array([0,0,0])
+        self.allowed_x_vel = np.array([-0.5, -0.4, -0.3, -0.2, -0.1 ,0 , 0.1 , 0.2, 0.3, 0.4, 0.5])
+        self.allowed_y_vel = np.array([-0.5, 0.0 , 0.5])
+        self.allowed_yaw_ang_vel = np.array([-0.5, 0.0 , 0.5])
+        self.current_x_vel_idx = self.allowed_x_vel[len(self.allowed_x_vel)//2]
+        self.current_y_vel_idx = self.allowed_y_vel[len(self.allowed_y_vel)//2]
+        self.current_yaw_ang_vel_idx = self.allowed_yaw_ang_vel[len(self.allowed_yaw_ang_vel)//2]
+
         # init motor command
         self.motor_cmd = []
         for id in range(HW_DOF):
@@ -271,24 +282,99 @@ class DeployNode(Node):
     # subscriber callbacks
     ##############################
 
+    # def joy_stick_cb(self, msg):
+    #     if msg.keys == 2:  # L1: emergency stop
+    #         self.get_logger().info("Emergency stop")
+    #         self.set_gains(np.array([0.0]*HW_DOF),self.env.d_gains)
+    #         self.set_motor_position(q=self.env.default_dof_pos_np)
+    #         if LOG_DATA:
+    #             print("Saving data")
+    #             np.savez('captured_data.npz', action=np.array(self.action_hist), dof_pos=np.array(self.dof_pos_hist),
+    #                     dof_vel=np.array(self.dof_vel_hist),imu=np.array(self.imu_hist),ang_vel=np.array(self.ang_vel_hist),
+    #                     tau=np.array(self.tau_hist), obs=np.array(self.obs_hist))
+    #         raise SystemExit
+    #     if msg.keys == 32:  # L2: start policy
+    #         if self.stand_up:
+    #             self.get_logger().info("Start policy")
+    #             self.start_policy = True
+    #             self.policy_start_time = time.monotonic()
+    #         else:
+    #             self.get_logger().info("Wait for standing up first")
+
+    def reset_indices(self):
+        self.current_x_vel_idx = len(self.allowed_x_vel) // 2
+        self.current_y_vel_idx = len(self.allowed_y_vel) // 2
+        self.current_yaw_ang_vel_idx = len(self.allowed_yaw_ang_vel) // 2
+
     def joy_stick_cb(self, msg):
-        if msg.keys == 2:  # L1: emergency stop
+        # Emergency stop with L2
+        if msg.keys == 32:
             self.get_logger().info("Emergency stop")
-            self.set_gains(np.array([0.0]*HW_DOF),self.env.d_gains)
+            self.set_gains(np.array([0.0] * HW_DOF), self.env.d_gains)
             self.set_motor_position(q=self.env.default_dof_pos_np)
+            self.commands = np.array([0, 0, 0])
+            self.reset_indices()
             if LOG_DATA:
                 print("Saving data")
-                np.savez('captured_data.npz', action=np.array(self.action_hist), dof_pos=np.array(self.dof_pos_hist),
-                        dof_vel=np.array(self.dof_vel_hist),imu=np.array(self.imu_hist),ang_vel=np.array(self.ang_vel_hist),
+                np.savez('captured_data.npz', action=np.array(self.action_hist),
+                        dof_pos=np.array(self.dof_pos_hist), dof_vel=np.array(self.dof_vel_hist),
+                        imu=np.array(self.imu_hist), ang_vel=np.array(self.ang_vel_hist),
                         tau=np.array(self.tau_hist), obs=np.array(self.obs_hist))
             raise SystemExit
-        if msg.keys == 32:  # L2: start policy
+
+        # Adjust x velocity index with X + R1/L1
+        if msg.keys == 8:  # X button is pressed
+            if msg.keys & 16:  # R1 is pressed
+                if self.current_x_vel_idx < len(self.allowed_x_vel) - 1:
+                    self.current_x_vel_idx += 1
+                    self.get_logger().info(f"Increasing x velocity to {self.allowed_x_vel[self.current_x_vel_idx]}")
+
+            if msg.keys & 2:  # L1 is pressed
+                if self.current_x_vel_idx > 0:
+                    self.current_x_vel_idx -= 1
+                    self.get_logger().info(f"Decreasing x velocity to {self.allowed_x_vel[self.current_x_vel_idx]}")
+
+        # Adjust y velocity index with Y + R1/L1
+        if msg.keys == 1:  # Y button is pressed
+            if msg.keys & 16:  # R1 is pressed
+                if self.current_y_vel_idx < len(self.allowed_y_vel) - 1:
+                    self.current_y_vel_idx += 1
+                    self.get_logger().info(f"Increasing y velocity to {self.allowed_y_vel[self.current_y_vel_idx]}")
+
+            if msg.keys & 2:  # L1 is pressed
+                if self.current_y_vel_idx > 0:
+                    self.current_y_vel_idx -= 1
+                    self.get_logger().info(f"Decreasing y velocity to {self.allowed_y_vel[self.current_y_vel_idx]}")
+
+        # Adjust yaw angular velocity index with B + R1/L1
+        if msg.keys == 4:  # B button is pressed
+            if msg.keys & 16:  # R1 is pressed
+                if self.current_yaw_ang_vel_idx < len(self.allowed_yaw_ang_vel) - 1:
+                    self.current_yaw_ang_vel_idx += 1
+                    self.get_logger().info(f"Increasing yaw angular velocity to {self.allowed_yaw_ang_vel[self.current_yaw_ang_vel_idx]}")
+
+            if msg.keys & 2:  # L1 is pressed
+                if self.current_yaw_ang_vel_idx > 0:
+                    self.current_yaw_ang_vel_idx -= 1
+                    self.get_logger().info(f"Decreasing yaw angular velocity to {self.allowed_yaw_ang_vel[self.current_yaw_ang_vel_idx]}")
+
+        # Start policy with R2
+        if msg.keys == 64:
             if self.stand_up:
                 self.get_logger().info("Start policy")
                 self.start_policy = True
                 self.policy_start_time = time.monotonic()
+                self.commands = np.array([0, 0, 0])
+                self.reset_indices()
             else:
                 self.get_logger().info("Wait for standing up first")
+                
+        # Update commands array
+        self.commands = np.array([
+            self.allowed_x_vel[self.current_x_vel_idx],
+            self.allowed_y_vel[self.current_y_vel_idx],
+            self.allowed_yaw_ang_vel[self.current_yaw_ang_vel_idx]
+        ])
 
     def lowlevel_state_cb(self, msg: LowState):
         # imu data
@@ -404,8 +490,8 @@ class DeployNode(Node):
         target_jt_hw = self.env.default_dof_pos_np
         pose = np.array([0]*5)
         # udp sending obs
-        obs_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        obs_receiver_address = ('192.168.123.164', 5704)
+        # obs_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        # obs_receiver_address = ('192.168.123.164', 5704)
         self.get_logger().info("start main loop")
         
         while rclpy.ok():
@@ -429,27 +515,31 @@ class DeployNode(Node):
                 # fetch proprioceptive data
                 self.obs_joint_vel_ = self.reindex_hw2urdf(self.obs_joint_vel)
                 self.obs_joint_pos_ = self.reindex_hw2urdf(self.obs_joint_pos)
-                """- self.obs_imu: IMU data (roll and pitch)
-                    - self.obs_ang_vel: Angular velocity
-                    - self.obs_joint_pos_: Joint positions (reindexed from hardware to URDF order)
-                    - self.obs_joint_vel_: Joint velocities (reindexed from hardware to URDF order)
-                    - self.prev_action: Previous action taken by the policy
-                    - target_jt_hw: Target joint positions (reindexed and scaled)
-                    - pose: Additional pose information for some tasks
-                    """
+                
+                # ip: policy input in previous implementation
                 """
-                self.projected_gravity,
-                self.commands[:, :3] * self.commands_scale,
-                (self.dof_pos - self.default_dof_pos) * self.obs_scales.dof_pos,
-                self.dof_vel * self.obs_scales.dof_vel,
-                self.actions
+                - self.obs_imu: IMU data (roll and pitch)
+                - self.obs_ang_vel: Angular velocity
+                - self.obs_joint_pos_: Joint positions (reindexed from hardware to URDF order)
+                - self.obs_joint_vel_: Joint velocities (reindexed from hardware to URDF order)
+                - self.prev_action: Previous action taken by the policy
+                - target_jt_hw: Target joint positions (reindexed and scaled)
+                - pose: Additional pose information for some tasks
+                """
+                # ip: policy input in our implementation
+                """
+                - self.projected_gravity,
+                - self.commands[:, :3] * self.commands_scale,
+                - (self.dof_pos - self.default_dof_pos) * self.obs_scales.dof_pos,
+                - self.dof_vel * self.obs_scales.dof_vel,
+                - self.actions : Previous action taken by the policy
                 """
                 if self.task == "stand" or self.task == "stand_w_waist" or self.task=='squat':
                     self.obs_buf_np = np.concatenate((self.obs_imu, self.obs_ang_vel, self.obs_joint_pos_, self.obs_joint_vel_, self.prev_action, self.reindex_hw2urdf(target_jt_hw)*self.env.scale_dof_pos, np.zeros(5)))  # add reference input TODO
                 elif self.task=='wb':
                     self.obs_buf_np = np.concatenate((self.obs_imu, self.obs_ang_vel, self.obs_joint_pos_, self.obs_joint_vel_, self.prev_action, self.reindex_hw2urdf(target_jt_hw)*self.env.scale_dof_pos, pose))  # add reference input TODO
                 elif self.task == 'walk': 
-                    self.obs_buf_np = np.concatenate((self.projected_gravity, self.commands, self.obs_joint_pos_, self.obs_joint_vel_, self.prev_action))  # add reference input TODO
+                    self.obs_buf_np = np.concatenate((self.projected_gravity, self.commands, self.obs_joint_pos_, self.obs_joint_vel_, self.prev_action))  
                 
                 obs_buf = torch.tensor(self.obs_buf_np,dtype=torch.float, device=self.device).unsqueeze(0)
                 if self.task == 'walk':
@@ -457,6 +547,7 @@ class DeployNode(Node):
                         self.env.obs_history_buf[:, 1:],
                         obs_buf.unsqueeze(1)
                     ], dim=1)
+                # ip: do we really need this braching now ?
                 else:
                     self.env.obs_history_buf = torch.cat([
                         self.env.obs_history_buf[:, 1:],
@@ -509,20 +600,32 @@ class DeployNode(Node):
                         self.get_logger().info(f"inference time: {inference_time}")
                         while 0.01-time.monotonic()+loop_start_time > 0:
                             pass
+                    elif self.task == 'walk':
+                        angles = self.reindex_urdf2hw(self.prev_action) * self.env.scale_action + self.env.default_dof_pos_np
+                        self.angles = np.clip(angles, self.env.joint_limit_lo, self.env.joint_limit_hi)
+                    
+                    
                     if LOG_DATA:
                         self.action_hist.append(self.prev_action)
-                    if np.any(np.isnan(target_jt_hw)):
-                        self.get_logger().info("Emergency stop due to NaN")
-                        self.set_gains(np.array([0.0]*HW_DOF),self.env.d_gains)
-                        self.set_motor_position(q=self.env.default_dof_pos_np)
-                        raise SystemExit
-                    """Just a way of updaiting a field for publishing it later, make sure if vel of angles poses !!"""
+                    # if np.any(np.isnan(target_jt_hw)):
+                    #     self.get_logger().info("Emergency stop due to NaN")
+                    #     self.set_gains(np.array([0.0]*HW_DOF),self.env.d_gains)
+                    #     self.set_motor_position(q=self.env.default_dof_pos_np)
+                    #     raise SystemExit
                     self.set_motor_position(self.angles)
                     if not NO_MOTOR:
-                        """the publishing it later !!!"""
                         self.motor_pub.publish(self.cmd_msg)
                 
-            while 0.019969-time.monotonic()+loop_start_time>0:  #0.012473  0.019963
+            # while 0.019969-time.monotonic()+loop_start_time>0:  #0.012473  0.019963
+            #     pass
+            # cnt+=1
+            # if cnt == 500:
+            #     dt = (time.monotonic()-fps_ckt)/cnt
+            #     cnt = 0
+            #     fps_ckt = time.monotonic()
+            #     print(f"FPS: current dt ={dt}")
+
+            while (1/self.policy_freq)-time.monotonic()+loop_start_time>0: 
                 pass
             cnt+=1
             if cnt == 500:
