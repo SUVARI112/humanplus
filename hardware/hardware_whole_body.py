@@ -30,11 +30,41 @@ from dynamixel_client import DynamixelClient
 POS_STOP_F = 2.146e9
 VEL_STOP_F = 16000.0
 HW_DOF = 20
+gravity_vec = np.array([0.,0.,-1.])
 
 WALK_STRAIGHT = False
 LOG_DATA = False
 USE_GRIPPPER = False
 NO_MOTOR = False
+
+@torch.jit.script
+def quat_rotate_inverse(q, v):
+    shape = q.shape
+    q_w = q[:, -1]
+    q_vec = q[:, :3]
+    a = v * (2.0 * q_w ** 2 - 1.0).unsqueeze(-1)
+    b = torch.cross(q_vec, v, dim=-1) * q_w.unsqueeze(-1) * 2.0
+    c = q_vec * \
+        torch.bmm(q_vec.view(shape[0], 1, 3), v.view(
+            shape[0], 3, 1)).squeeze(-1) * 2.0
+    return a - b + c
+
+@torch.jit.script
+def quat_from_euler_xyz(roll, pitch, yaw):
+    cy = torch.cos(yaw * 0.5)
+    sy = torch.sin(yaw * 0.5)
+    cr = torch.cos(roll * 0.5)
+    sr = torch.sin(roll * 0.5)
+    cp = torch.cos(pitch * 0.5)
+    sp = torch.sin(pitch * 0.5)
+
+    qw = cy * cr * cp + sy * sr * sp
+    qx = cy * sr * cp - sy * cr * sp
+    qy = cy * cr * sp + sy * sr * cp
+    qz = sy * cr * cp - cy * sr * sp
+
+    return torch.stack([qx, qy, qz, qw], dim=-1)
+
 
 def wrap_to_pi(angles):
     angles %= 2*np.pi
@@ -97,8 +127,18 @@ class H1():
         elif self.task=='wb' or self.task=='squat':
             self.num_observations = 62 + 19 + 5
             self.num_actions = 19
+
+        # ip: Defining a new task for our application (walking).    
+        elif self.task == 'walk':
+            self.num_observations = 63 # + 19 + 5
+            self.num_actions = 19
+
         self.num_privileged_obs = None
-        self.obs_context_len=8
+        # ip: defining the context length with 1.   
+        if self.task == 'walk':
+            self.obs_context_len = 1
+        else:
+            self.obs_context_len = 8
 
         self.scale_lin_vel = 1.0
         self.scale_ang_vel = 1.0
@@ -107,6 +147,8 @@ class H1():
         self.scale_dof_vel = 1.0
         self.scale_action = 1.0
 
+        # ip: I think it make since to rewrite this part to add the weights as they are in the simulation.
+        # ip: interesting thing: the p gains and d gains are set different for some joints according to the task (why !?)
         # prepare action deployment joint positions offsets and PD gains
         if self.task=='stand':
             arm_pgain = 40
@@ -126,6 +168,8 @@ class H1():
         elif self.task=='wb' or self.task=='squat':
             ankle_pgain = 50
             ankle_dgain = 1
+        
+
         self.p_gains = np.array([leg_pgain,leg_pgain,knee_pgain,leg_pgain,leg_pgain,knee_pgain,leg_pgain,leg_pgain,leg_pgain,0,ankle_pgain,ankle_pgain,arm_pgain,arm_pgain,arm_pgain,arm_pgain,arm_pgain,arm_pgain,arm_pgain,arm_pgain],dtype=np.float64)
         self.d_gains = np.array([leg_dgain,leg_dgain,knee_dgain,leg_dgain,leg_dgain,knee_dgain,leg_dgain,leg_dgain,leg_dgain,0,ankle_dgain,ankle_dgain,arm_dgain,arm_dgain,arm_dgain,arm_dgain,arm_dgain,arm_dgain,arm_dgain,arm_dgain],dtype=np.float64)
         self.joint_limit_lo = [-0.43,-1.57,-0.26,-0.43,-1.57,-0.26,-2.35,-0.43,-0.43,0,-0.87,-0.87,-2.87,-3.11,-4.45,-1.25,-2.87,-0.34,-1.3,-1.25]
@@ -147,7 +191,7 @@ class DeployNode(Node):
     def __init__(self,task='stand'):
         super().__init__("deploy_node")  # type: ignore
         self.task = task
-        if self.task not in ['stand','stand_w_waist','wb','squat']:
+        if self.task not in ['stand','stand_w_waist','wb','squat', 'walk']:
             self.get_logger().info("Invalid task")
             raise SystemExit
         
@@ -183,10 +227,10 @@ class DeployNode(Node):
         self.start_policy = False
 
         # init multiprocess values
-        self.wrist_l = multiprocessing.Value('f', 0.)
-        self.wrist_r = multiprocessing.Value('f', 0.)
-        self.body_ref = multiprocessing.Array('f', [0]*24) #[0]*12+[0.3]+[0]*3+[-0.3]+[0]*7)
-        self.hand_ref = multiprocessing.Array('f', [160]*6+[0]+[160]*7+[0]+[160])
+        # self.wrist_l = multiprocessing.Value('f', 0.)
+        # self.wrist_r = multiprocessing.Value('f', 0.)
+        # self.body_ref = multiprocessing.Array('f', [0]*24) #[0]*12+[0.3]+[0]*3+[-0.3]+[0]*7)
+        # self.hand_ref = multiprocessing.Array('f', [160]*6+[0]+[160]*7+[0]+[160])
 
         # standing up
         self.get_logger().info("Standing up")
@@ -254,6 +298,9 @@ class DeployNode(Node):
         self.obs_ang_vel = np.array(imu_data.gyroscope)*self.env.scale_ang_vel
         self.obs_imu = np.array([self.roll, self.pitch])*self.env.scale_orn
 
+        self.base_quat = quat_from_euler_xyz(self.roll, self.pitch, self.yaw)
+        self.projected_gravity = quat_rotate_inverse(self.base_quat, gravity_vec)
+
         # termination condition
         r_threshold = abs(self.roll) > 0.5
         p_threshold = abs(self.pitch) > 0.5
@@ -300,6 +347,7 @@ class DeployNode(Node):
 
         # load policy
         file_pth = os.path.dirname(os.path.realpath(__file__))
+        # ip: We should change the name of the policy and place it in the mentioned location 
         self.policy = torch.jit.load(os.path.join(file_pth, "./ckpt/policy.pt"), map_location=self.env.device)  #0253 396
         self.policy.to(self.env.device)
         actions = self.policy(self.env.obs_history_buf.detach())  # first inference takes longer time
@@ -314,24 +362,25 @@ class DeployNode(Node):
         self.cmd_msg.motor_cmd = self.motor_cmd.copy()
         self.angles = self.env.default_dof_pos
 
-    def get_retarget(self):
-        target_jt = self.body_ref[:19]
-        if self.task == "stand":
-            reference_pose = self.reindex_urdf2hw(target_jt) + self.env.default_dof_pos_np
-            reference_pose_clip = np.clip(reference_pose, self.env.joint_limit_lo, self.env.joint_limit_hi)
-            reference_pose_clip[:12] = self.env.default_dof_pos_np[:12]
-            return reference_pose_clip
-        elif self.task == "stand_w_waist":
-            target_jt[10]*=2
-            pose = np.array(self.body_ref[19:])
-            reference_pose = self.reindex_urdf2hw(target_jt) + self.env.default_dof_pos_np
-            reference_pose[:6] = self.env.default_dof_pos_np[:6]
-            reference_pose[7:12] = self.env.default_dof_pos_np[7:12]
-            return reference_pose, pose  # no clip for the target
-        elif self.task == "wb" or self.task == "squat":
-            pose = np.array(self.body_ref[19:])
-            reference_pose = self.reindex_urdf2hw(target_jt) + self.env.default_dof_pos_np
-        return reference_pose, pose  # no clip for the target
+    # ip: NO need for retargeting since there well be no external reference data for our application.
+    # def get_retarget(self):
+    #     target_jt = self.body_ref[:19]
+    #     if self.task == "stand":
+    #         reference_pose = self.reindex_urdf2hw(target_jt) + self.env.default_dof_pos_np
+    #         reference_pose_clip = np.clip(reference_pose, self.env.joint_limit_lo, self.env.joint_limit_hi)
+    #         reference_pose_clip[:12] = self.env.default_dof_pos_np[:12]
+    #         return reference_pose_clip
+    #     elif self.task == "stand_w_waist":
+    #         target_jt[10]*=2
+    #         pose = np.array(self.body_ref[19:])
+    #         reference_pose = self.reindex_urdf2hw(target_jt) + self.env.default_dof_pos_np
+    #         reference_pose[:6] = self.env.default_dof_pos_np[:6]
+    #         reference_pose[7:12] = self.env.default_dof_pos_np[7:12]
+    #         return reference_pose, pose  # no clip for the target
+    #     elif self.task == "wb" or self.task == "squat":
+    #         pose = np.array(self.body_ref[19:])
+    #         reference_pose = self.reindex_urdf2hw(target_jt) + self.env.default_dof_pos_np
+    #     return reference_pose, pose  # no clip for the target
 
     @torch.no_grad()
     def main_loop(self):
@@ -370,13 +419,13 @@ class DeployNode(Node):
 
             if self.start_policy:
                 # policy inference
-                if cnt % 2 == 0:
-                    if self.task == "stand":
-                        target_jt_hw = self.get_retarget()
-                    elif self.task == "stand_w_waist" or self.task=='wb' or self.task=='squat':
-                        target_jt_hw,pose = self.get_retarget()
+                # if cnt % 2 == 0:
+                #     if self.task == "stand":
+                #         target_jt_hw = self.get_retarget()
+                #     elif self.task == "stand_w_waist" or self.task=='wb' or self.task=='squat':
+                #         target_jt_hw,pose = self.get_retarget()
 
-                """ the part where the state is given to the policy and the output is given !!! """
+                # ip: the part where the state is given to the policy and the output is given
                 # fetch proprioceptive data
                 self.obs_joint_vel_ = self.reindex_hw2urdf(self.obs_joint_vel)
                 self.obs_joint_pos_ = self.reindex_hw2urdf(self.obs_joint_pos)
@@ -388,22 +437,39 @@ class DeployNode(Node):
                     - target_jt_hw: Target joint positions (reindexed and scaled)
                     - pose: Additional pose information for some tasks
                     """
+                """
+                self.projected_gravity,
+                self.commands[:, :3] * self.commands_scale,
+                (self.dof_pos - self.default_dof_pos) * self.obs_scales.dof_pos,
+                self.dof_vel * self.obs_scales.dof_vel,
+                self.actions
+                """
                 if self.task == "stand" or self.task == "stand_w_waist" or self.task=='squat':
                     self.obs_buf_np = np.concatenate((self.obs_imu, self.obs_ang_vel, self.obs_joint_pos_, self.obs_joint_vel_, self.prev_action, self.reindex_hw2urdf(target_jt_hw)*self.env.scale_dof_pos, np.zeros(5)))  # add reference input TODO
                 elif self.task=='wb':
                     self.obs_buf_np = np.concatenate((self.obs_imu, self.obs_ang_vel, self.obs_joint_pos_, self.obs_joint_vel_, self.prev_action, self.reindex_hw2urdf(target_jt_hw)*self.env.scale_dof_pos, pose))  # add reference input TODO
+                elif self.task == 'walk': 
+                    self.obs_buf_np = np.concatenate((self.projected_gravity, self.commands, self.obs_joint_pos_, self.obs_joint_vel_, self.prev_action))  # add reference input TODO
+                
                 obs_buf = torch.tensor(self.obs_buf_np,dtype=torch.float, device=self.device).unsqueeze(0)
-                self.env.obs_history_buf = torch.cat([
-                    self.env.obs_history_buf[:, 1:],
-                    obs_buf.unsqueeze(1)
-                ], dim=1)
+                if self.task == 'walk':
+                    self.env.obs_history_buf = torch.cat([
+                        self.env.obs_history_buf[:, 1:],
+                        obs_buf.unsqueeze(1)
+                    ], dim=1)
+                else:
+                    self.env.obs_history_buf = torch.cat([
+                        self.env.obs_history_buf[:, 1:],
+                        obs_buf.unsqueeze(1)
+                    ], dim=1)
+
 
                 # send obs through udp
                 # qpos 19, qvel 19, orn 3, ang_vel 3, wrist 2
-                obs_imitation = np.concatenate((self.obs_joint_pos_, self.obs_joint_vel_,[self.roll, self.pitch, self.yaw], self.obs_ang_vel, [self.wrist_l.value, self.wrist_r.value]))
-                obs_imitation = np.array(obs_imitation).astype(np.float32)
-                obs_bytes = obs_imitation.tobytes()
-                obs_sock.sendto(obs_bytes, obs_receiver_address)
+                # obs_imitation = np.concatenate((self.obs_joint_pos_, self.obs_joint_vel_,[self.roll, self.pitch, self.yaw], self.obs_ang_vel, [self.wrist_l.value, self.wrist_r.value]))
+                # obs_imitation = np.array(obs_imitation).astype(np.float32)
+                # obs_bytes = obs_imitation.tobytes()
+                # obs_sock.sendto(obs_bytes, obs_receiver_address)
 
                 if self.init_buffer < 0:
                     self.init_buffer += 1
@@ -470,123 +536,123 @@ class DeployNode(Node):
 ##############################
 # hand controller process
 ##############################
-def hand_process(wrist_l,wrist_r,hand_ref):
-    test_start_time = time.time()
-    print('open port')
-    ser_r = openSerial('/dev/HandR', 115200)
-    ser_l = openSerial('/dev/HandL', 57600)
-    atexit.register(cleanup, ser_l,ser_r)
+# def hand_process(wrist_l,wrist_r,hand_ref):
+#     test_start_time = time.time()
+#     print('open port')
+#     ser_r = openSerial('/dev/HandR', 115200)
+#     ser_l = openSerial('/dev/HandL', 57600)
+#     atexit.register(cleanup, ser_l,ser_r)
 
-    print("init dynamixel")
-    dxl_motor_ids = [1,2] #left:1, right:2
-    dxl_port = '/dev/WRIST'
-    dxl_client = DynamixelClient(dxl_motor_ids, port=dxl_port, lazy_connect=True)
-    if not NO_MOTOR:
-        dxl_client.set_torque_enabled(dxl_motor_ids, True)
-    dxl_client.write_desired_pgain(dxl_motor_ids, np.array([1600]*2))
-    dxl_client.write_desired_dgain(dxl_motor_ids, np.array([0]*2))
+#     print("init dynamixel")
+#     dxl_motor_ids = [1,2] #left:1, right:2
+#     dxl_port = '/dev/WRIST'
+#     dxl_client = DynamixelClient(dxl_motor_ids, port=dxl_port, lazy_connect=True)
+#     if not NO_MOTOR:
+#         dxl_client.set_torque_enabled(dxl_motor_ids, True)
+#     dxl_client.write_desired_pgain(dxl_motor_ids, np.array([1600]*2))
+#     dxl_client.write_desired_dgain(dxl_motor_ids, np.array([0]*2))
 
-    if not NO_MOTOR:
-        write6(ser_r, 2, 'speedSet', [1000, 1000, 1000, 1000, 1000, 1000])
-        write6(ser_r, 2, 'forceSet', [500, 500, 500, 500, 500, 500])
-        write6(ser_r, 2, 'angleSet', [1000, 1000, 1000, 1000, 1000, 1000])
-        write6(ser_l, 1, 'speedSet', [1000, 1000, 1000, 1000, 1000, 1000])
-        write6(ser_l, 1, 'forceSet', [500, 500, 500, 500, 500, 500])
-        write6(ser_l, 1, 'angleSet', [1000, 1000, 1000, 1000, 1000, 1000])
-    time.sleep(0.5)
-    finger_cmd_r = np.array([-1]*6)
-    finger_cmd_l = np.array([-1]*6)
-    finger_angle_l_buf = []
-    finger_angle_r_buf = []
-    buffer_len = 12
+#     if not NO_MOTOR:
+#         write6(ser_r, 2, 'speedSet', [1000, 1000, 1000, 1000, 1000, 1000])
+#         write6(ser_r, 2, 'forceSet', [500, 500, 500, 500, 500, 500])
+#         write6(ser_r, 2, 'angleSet', [1000, 1000, 1000, 1000, 1000, 1000])
+#         write6(ser_l, 1, 'speedSet', [1000, 1000, 1000, 1000, 1000, 1000])
+#         write6(ser_l, 1, 'forceSet', [500, 500, 500, 500, 500, 500])
+#         write6(ser_l, 1, 'angleSet', [1000, 1000, 1000, 1000, 1000, 1000])
+#     time.sleep(0.5)
+#     finger_cmd_r = np.array([-1]*6)
+#     finger_cmd_l = np.array([-1]*6)
+#     finger_angle_l_buf = []
+#     finger_angle_r_buf = []
+#     buffer_len = 12
 
-    try:
-        while rclpy.ok():
-            start_time = time.time()
+#     try:
+#         while rclpy.ok():
+#             start_time = time.time()
 
-            requested_l = hand_ref[:8]
-            requested_r = hand_ref[8:]
-            finger_angle_r_buf.append(requested_r)
-            if len(finger_angle_r_buf) > buffer_len:
-                finger_angle_r_buf.pop(0)
-            finger_angle_r = np.mean(finger_angle_r_buf,axis=0)
+#             requested_l = hand_ref[:8]
+#             requested_r = hand_ref[8:]
+#             finger_angle_r_buf.append(requested_r)
+#             if len(finger_angle_r_buf) > buffer_len:
+#                 finger_angle_r_buf.pop(0)
+#             finger_angle_r = np.mean(finger_angle_r_buf,axis=0)
 
-            dist_r = (finger_angle_r[7] - 0.03)/(0.1-0.03)
-            finger_cmd_r[:3] = (np.clip((finger_angle_r[:3]-30)/(160-30)*1000,0,1000)).astype(int)  # range 30-160 30-close-cmd:0
-            finger_cmd_r[3] = (np.clip(dist_r*(1000-490)+490,490,1000)).astype(int)
-            finger_cmd_r[4] = (np.clip(dist_r*(1000-630)+630,630,1000)).astype(int)
-            lat_r = (np.clip((finger_angle_r[5]-65)/(85-65)*1000,0,1000)).astype(int)
-            if lat_r < 150:
-                finger_cmd_r[5] = 50 #(np.clip((finger_angle_r[5]-65)/(85-65)*1000,0,1000)).astype(int) 
-            else:
-                finger_cmd_r[5] = lat_r
-            wrist_ang_r = np.clip(-(finger_angle_r[6] + 0*30)*np.pi/180,-np.pi,np.pi)  #  30 -90
+#             dist_r = (finger_angle_r[7] - 0.03)/(0.1-0.03)
+#             finger_cmd_r[:3] = (np.clip((finger_angle_r[:3]-30)/(160-30)*1000,0,1000)).astype(int)  # range 30-160 30-close-cmd:0
+#             finger_cmd_r[3] = (np.clip(dist_r*(1000-490)+490,490,1000)).astype(int)
+#             finger_cmd_r[4] = (np.clip(dist_r*(1000-630)+630,630,1000)).astype(int)
+#             lat_r = (np.clip((finger_angle_r[5]-65)/(85-65)*1000,0,1000)).astype(int)
+#             if lat_r < 150:
+#                 finger_cmd_r[5] = 50 #(np.clip((finger_angle_r[5]-65)/(85-65)*1000,0,1000)).astype(int) 
+#             else:
+#                 finger_cmd_r[5] = lat_r
+#             wrist_ang_r = np.clip(-(finger_angle_r[6] + 0*30)*np.pi/180,-np.pi,np.pi)  #  30 -90
             
-            finger_angle_l_buf.append(requested_l)
-            if len(finger_angle_l_buf) > buffer_len:
-                finger_angle_l_buf.pop(0)
-            finger_angle_l = np.mean(finger_angle_l_buf,axis=0)
+#             finger_angle_l_buf.append(requested_l)
+#             if len(finger_angle_l_buf) > buffer_len:
+#                 finger_angle_l_buf.pop(0)
+#             finger_angle_l = np.mean(finger_angle_l_buf,axis=0)
 
-            dist_l = (finger_angle_l[7] - 0.03)/(0.1-0.03)
-            finger_cmd_l[:3] = (np.clip((finger_angle_l[:3]-30)/(160-30)*1000,0,1000)).astype(int)  # range 30-160 30-close-cmd:0
-            finger_cmd_l[3] = (np.clip(dist_l*(1000-490)+490,490,1000)).astype(int)
-            finger_cmd_l[4] = (np.clip(dist_l*(1000-535)+535,535,1000)).astype(int)
-            lat_l = 1000-(np.clip((finger_angle_l[5]-85)/(110-85)*1000,0,1000)).astype(int) 
-            if lat_l < 300:
-                finger_cmd_l[5] = 150 #1000-(np.clip((finger_angle_l[5]-85)/(110-85)*1000,0,1000)).astype(int)
-            else:
-                finger_cmd_l[5] = lat_l
-            wrist_ang_l = np.clip((finger_angle_l[6] + 0*30)*np.pi/180,-np.pi,np.pi)  #  30 -90
+#             dist_l = (finger_angle_l[7] - 0.03)/(0.1-0.03)
+#             finger_cmd_l[:3] = (np.clip((finger_angle_l[:3]-30)/(160-30)*1000,0,1000)).astype(int)  # range 30-160 30-close-cmd:0
+#             finger_cmd_l[3] = (np.clip(dist_l*(1000-490)+490,490,1000)).astype(int)
+#             finger_cmd_l[4] = (np.clip(dist_l*(1000-535)+535,535,1000)).astype(int)
+#             lat_l = 1000-(np.clip((finger_angle_l[5]-85)/(110-85)*1000,0,1000)).astype(int) 
+#             if lat_l < 300:
+#                 finger_cmd_l[5] = 150 #1000-(np.clip((finger_angle_l[5]-85)/(110-85)*1000,0,1000)).astype(int)
+#             else:
+#                 finger_cmd_l[5] = lat_l
+#             wrist_ang_l = np.clip((finger_angle_l[6] + 0*30)*np.pi/180,-np.pi,np.pi)  #  30 -90
 
-            dxl_pos, _, _ = dxl_client.read_pos_vel_cur()
-            if not NO_MOTOR:
-                dxl_client.write_desired_pos(dxl_motor_ids, np.array([wrist_ang_l+np.pi,wrist_ang_r+np.pi]))
+#             dxl_pos, _, _ = dxl_client.read_pos_vel_cur()
+#             if not NO_MOTOR:
+#                 dxl_client.write_desired_pos(dxl_motor_ids, np.array([wrist_ang_l+np.pi,wrist_ang_r+np.pi]))
 
-            wrist_l.value = dxl_pos[0] % (2*np.pi) - np.pi  # -pi~pi
-            wrist_r.value = dxl_pos[1] % (2*np.pi)- np.pi
+#             wrist_l.value = dxl_pos[0] % (2*np.pi) - np.pi  # -pi~pi
+#             wrist_r.value = dxl_pos[1] % (2*np.pi)- np.pi
 
-            if not NO_MOTOR:
-                write6(ser_r, 2, 'angleSet', finger_cmd_r)
-                write6(ser_l, 1, 'angleSet', finger_cmd_l)
-            time.sleep(max(0, 0.033 - (time.time() - start_time)))
+#             if not NO_MOTOR:
+#                 write6(ser_r, 2, 'angleSet', finger_cmd_r)
+#                 write6(ser_l, 1, 'angleSet', finger_cmd_l)
+#             time.sleep(max(0, 0.033 - (time.time() - start_time)))
 
-    finally:
-        print("closing port")
-        dxl_client.set_torque_enabled(dxl_motor_ids, False)
+#     finally:
+#         print("closing port")
+#         dxl_client.set_torque_enabled(dxl_motor_ids, False)
 
-        ser_r.flush()
-        ser_r.reset_input_buffer()
-        ser_r.reset_output_buffer()
-        ser_l.flush()
-        ser_l.reset_input_buffer()
-        ser_l.reset_output_buffer()
-        ser_r.close()
-        ser_l.close()
+#         ser_r.flush()
+#         ser_r.reset_input_buffer()
+#         ser_r.reset_output_buffer()
+#         ser_l.flush()
+#         ser_l.reset_input_buffer()
+#         ser_l.reset_output_buffer()
+#         ser_r.close()
+#         ser_l.close()
 
-##############################
-# udp process
-##############################
-def udp_body_recv(body_ref):
-    sock_body = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    body_server_address = ('192.168.123.163', 5701) 
-    sock_body.bind(body_server_address)
+# ##############################
+# # udp process
+# ##############################
+# def udp_body_recv(body_ref):
+#     sock_body = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+#     body_server_address = ('192.168.123.163', 5701) 
+#     sock_body.bind(body_server_address)
 
-    while True:
-        # get hand data: udp
-        body_data, address = sock_body.recvfrom(300)
-        target_jt = np.frombuffer(body_data, dtype=np.float32)
-        body_ref[:] = target_jt[:]
+#     while True:
+#         # get hand data: udp
+#         body_data, address = sock_body.recvfrom(300)
+#         target_jt = np.frombuffer(body_data, dtype=np.float32)
+#         body_ref[:] = target_jt[:]
         
-def udp_hand_recv(hand_ref):
-    sock_hand = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    hand_server_address = ('192.168.123.163', 5702) 
-    sock_hand.bind(hand_server_address)
+# def udp_hand_recv(hand_ref):
+#     sock_hand = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+#     hand_server_address = ('192.168.123.163', 5702) 
+#     sock_hand.bind(hand_server_address)
 
-    while True:
-        # get hand data: udp
-        hand_data, address = sock_hand.recvfrom(300)
-        hand_arr = np.frombuffer(hand_data, dtype=np.float32)
-        hand_ref[:] = hand_arr[:]
+#     while True:
+#         # get hand data: udp
+#         hand_data, address = sock_hand.recvfrom(300)
+#         hand_arr = np.frombuffer(hand_data, dtype=np.float32)
+#         hand_ref[:] = hand_arr[:]
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -596,18 +662,18 @@ if __name__ == "__main__":
     rclpy.init(args=None)
     dp_node = DeployNode(args.task_name)
     dp_node.get_logger().info("Deploy node started")
-    body_udp_process = multiprocessing.Process(target=udp_body_recv,args=(dp_node.body_ref,))
-    hand_udp_process = multiprocessing.Process(target=udp_hand_recv,args=(dp_node.hand_ref,))
-    serial_process = multiprocessing.Process(target=hand_process,args=(dp_node.wrist_l,dp_node.wrist_r,dp_node.hand_ref,))
-    body_udp_process.daemon = True
-    hand_udp_process.daemon = True
-    serial_process.daemon = True 
-    body_udp_process.start()
-    hand_udp_process.start()
-    serial_process.start()
+    # body_udp_process = multiprocessing.Process(target=udp_body_recv,args=(dp_node.body_ref,))
+    # hand_udp_process = multiprocessing.Process(target=udp_hand_recv,args=(dp_node.hand_ref,))
+    # serial_process = multiprocessing.Process(target=hand_process,args=(dp_node.wrist_l,dp_node.wrist_r,dp_node.hand_ref,))
+    # body_udp_process.daemon = True
+    # hand_udp_process.daemon = True
+    # serial_process.daemon = True 
+    # body_udp_process.start()
+    # hand_udp_process.start()
+    # serial_process.start()
 
     dp_node.main_loop()
     rclpy.shutdown()
-    body_udp_process.join()
-    hand_udp_process.join()
-    serial_process.join()
+    # body_udp_process.join()
+    # hand_udp_process.join()
+    # serial_process.join()
